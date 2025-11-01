@@ -1,6 +1,7 @@
 //! CPU-based SHA-1 hasher implementation for TS3 security level calculation
 
 use sha1::{Digest, Sha1};
+use rayon::prelude::*;
 use crate::level_improver::SecurityLevelHasher;
 use crate::helpers::count_trailing_zero_bits;
 
@@ -15,6 +16,13 @@ impl SecurityLevelHasher for CpuHasher {
         let hash = hasher.finalize();
 
         count_trailing_zero_bits(&hash)
+    }
+
+    /// Batch processing using rayon for parallel computation across CPU cores
+    fn calculate_levels_batch(&self, public_key: &str, counters: &[u64]) -> Vec<u8> {
+        counters.par_iter()
+            .map(|&counter| self.calculate_level(public_key, counter))
+            .collect()
     }
 
     fn name(&self) -> &str {

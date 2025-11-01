@@ -1,4 +1,5 @@
-#[deny(unsafe_code,unused)]
+#![deny(unsafe_code, unused)]
+
 mod identity;
 mod level_improver;
 mod hashers;
@@ -21,8 +22,8 @@ fn main() {
         Command::Decode { file, string } => {
             decode_identity(file, string);
         }
-        Command::Increase { file, string, target, method } => {
-            increase_level(file, string, target, method);
+        Command::Increase { file, string, target, method, batch_size } => {
+            increase_level(file, string, target, method, batch_size);
         }
     }
 }
@@ -65,7 +66,7 @@ fn decode_identity(file: Option<String>, string: Option<String>) {
              2_f64.powi(identity.security_level() as i32));
 }
 
-fn increase_level(file: Option<String>, string: Option<String>, target_level: u8, method: HasherMethod) {
+fn increase_level(file: Option<String>, string: Option<String>, target_level: u8, method: HasherMethod, batch_size: Option<usize>) {
     println!("🚀 TeamSpeak 3 Security Level Improver\n");
 
     // Determine input mode
@@ -106,14 +107,20 @@ fn increase_level(file: Option<String>, string: Option<String>, target_level: u8
         std::process::exit(0);
     }).expect("Error setting Ctrl-C handler");
 
+    // Determine batch size (use defaults if not specified)
+    let batch_size = batch_size.unwrap_or(match method {
+        HasherMethod::Cpu => 10_000,   // CPU: smaller batches for better responsiveness
+        HasherMethod::Cuda => 100_000, // CUDA: larger batches for better GPU utilization
+    });
+
     // Create improver based on method
     match method {
         HasherMethod::Cpu => {
             println!("⚙️  Method: CPU\n");
             if let Some(file_path) = file {
-                run_improver_file(&file_path, target_level, CpuHasher);
+                run_improver_file(&file_path, target_level, CpuHasher, batch_size);
             } else if let Some(identity_str) = string {
-                run_improver_string(&identity_str, target_level, CpuHasher);
+                run_improver_string(&identity_str, target_level, CpuHasher, batch_size);
             }
         }
         HasherMethod::Cuda => {
@@ -121,9 +128,9 @@ fn increase_level(file: Option<String>, string: Option<String>, target_level: u8
             match CudaHasher::new() {
                 Ok(cuda_hasher) => {
                     if let Some(file_path) = file {
-                        run_improver_file(&file_path, target_level, cuda_hasher);
+                        run_improver_file(&file_path, target_level, cuda_hasher, batch_size);
                     } else if let Some(identity_str) = string {
-                        run_improver_string(&identity_str, target_level, cuda_hasher);
+                        run_improver_string(&identity_str, target_level, cuda_hasher, batch_size);
                     }
                 }
                 Err(e) => {
@@ -141,8 +148,9 @@ fn run_improver_file<H: SecurityLevelHasher>(
     file_path: &str,
     target_level: u8,
     hasher: H,
+    batch_size: usize,
 ) {
-    let mut improver = match LevelImprover::new(file_path, hasher) {
+    let mut improver = match LevelImprover::with_batch_size(file_path, hasher, batch_size) {
         Ok(imp) => imp,
         Err(e) => {
             eprintln!("❌ Error initializing level improver: {}", e);
@@ -190,6 +198,7 @@ fn run_improver_string<H: SecurityLevelHasher>(
     identity_str: &str,
     target_level: u8,
     hasher: H,
+    batch_size: usize,
 ) {
     use std::time::{Duration, Instant};
 
@@ -210,9 +219,7 @@ fn run_improver_string<H: SecurityLevelHasher>(
     let start_time = Instant::now();
     let mut last_print = Instant::now();
 
-    const BATCH_SIZE: u64 = 10_000;
-
-    println!("\nStarting level improvement search...");
+    println!("\nStarting level improvement search (batch size: {})...", batch_size);
     println!("Press Ctrl+C to stop\n");
 
     let reached_target = Arc::new(AtomicBool::new(false));
@@ -222,14 +229,21 @@ fn run_improver_string<H: SecurityLevelHasher>(
             break;
         }
 
-        // Check a batch of counters
-        for _ in 0..BATCH_SIZE {
-            let level = hasher.calculate_level(&omega, current_counter);
-            hashes_checked += 1;
+        // Prepare batch of counters to check
+        let counters: Vec<u64> = (current_counter..current_counter + batch_size as u64).collect();
+
+        // Process entire batch at once (parallel on CPU, batched on GPU)
+        let levels = hasher.calculate_levels_batch(&omega, &counters);
+
+        hashes_checked += counters.len() as u64;
+
+        // Check for improved levels in batch results
+        for (i, &level) in levels.iter().enumerate() {
+            let counter = counters[i];
 
             if level > best_level {
                 best_level = level;
-                best_counter = current_counter;
+                best_counter = counter;
 
                 println!("\n🎉 NEW LEVEL FOUND!");
                 println!("   Counter: {}", best_counter);
@@ -244,9 +258,9 @@ fn run_improver_string<H: SecurityLevelHasher>(
                     break;
                 }
             }
-
-            current_counter += 1;
         }
+
+        current_counter += batch_size as u64;
 
         // Print progress every second
         if last_print.elapsed() >= Duration::from_secs(1) {

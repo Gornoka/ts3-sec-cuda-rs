@@ -39,6 +39,11 @@ pub enum Command {
         /// Hasher method to use
         #[arg(short = 'm', long, value_enum, default_value_t = HasherMethod::Cpu)]
         method: HasherMethod,
+
+        /// Batch size for processing (CPU: 10000, CUDA: 100000)
+        /// Higher values = better GPU utilization but more memory
+        #[arg(short, long)]
+        batch_size: Option<usize>,
     },
 }
 
@@ -46,6 +51,6 @@ pub enum Command {
 pub enum HasherMethod {
     /// CPU-based SHA-1 hashing
     Cpu,
-    /// CUDA/GPU-based SHA-1 hashing (not yet implemented)
+    /// CUDA/GPU-based SHA-1 hashing
     Cuda,
 }

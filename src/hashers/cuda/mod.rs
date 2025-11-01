@@ -7,6 +7,15 @@ use cudarc::driver::*;
 use cudarc::nvrtc::Ptx;
 use std::sync::Arc;
 
+/// SHA1 initial hash values (RFC 3174)
+const SHA1_INIT_HASH: [u32; 5] = [
+    0x67452301,
+    0xEFCDAB89,
+    0x98BADCFE,
+    0x10325476,
+    0xC3D2E1F0,
+];
+
 /// CUDA-based hasher using GPU acceleration
 pub struct CudaHasher {
     ctx: Arc<CudaContext>,
@@ -30,77 +39,81 @@ impl CudaHasher {
         Ok(Self { ctx, module })
     }
 
+    /// Hash multiple messages in parallel using the CUDA kernel
+    /// Returns a vector of 20-byte (160-bit) SHA1 hashes
+    ///
+    /// # Performance
+    /// This is **much faster** than calling `hash_message` in a loop because
+    /// all hashes are computed in parallel on the GPU.
+    ///
+    /// # Note
+    /// Currently, all messages must have the same length and fit in a single block (≤55 bytes).
+    /// For full multi-block support in batch mode, additional implementation is needed.
+    #[allow(dead_code)] // Public API method, not used internally but available for library consumers
+    pub fn hash_messages_batch(&self, messages: &[&[u8]]) -> Result<Vec<[u8; 20]>, CudaError> {
+        if messages.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let num_hashes = messages.len();
+
+        // For now, ensure all messages have the same length and fit in one block
+        let first_len = messages[0].len();
+        if first_len > 55 {
+            // Fall back to sequential processing for long messages
+            return messages.iter()
+                .map(|msg| self.hash_message(msg))
+                .collect();
+        }
+
+        for msg in messages {
+            if msg.len() != first_len {
+                // Fall back to sequential processing for variable-length messages
+                return messages.iter()
+                    .map(|msg| self.hash_message(msg))
+                    .collect();
+            }
+        }
+
+        // Prepare all input blocks
+        let mut input_blocks = Vec::with_capacity(num_hashes);
+        for msg in messages {
+            let blocks = prepare_sha1_blocks(msg);
+            input_blocks.push(blocks[0]); // Take first block (all messages fit in one)
+        }
+
+        // Flatten into a single array for GPU transfer
+        let flat_input: Vec<u32> = input_blocks.iter()
+            .flat_map(|block| block.iter().copied())
+            .collect();
+
+        let results = launch_batch_kernel(
+            &self.ctx,
+            &self.module,
+            &flat_input,
+            &SHA1_INIT_HASH,
+            num_hashes,
+        )?;
+
+        Ok(results)
+    }
+
     /// Hash a message using the CUDA kernel
     /// Returns the 20-byte (160-bit) SHA1 hash
     /// Supports multi-block messages of any length
+    ///
+    /// For hashing multiple messages, use `hash_messages_batch` instead for better performance.
     pub fn hash_message(&self, message: &[u8]) -> Result<[u8; 20], CudaError> {
         let blocks = prepare_sha1_blocks(message);
-
-        let stream = self.ctx.default_stream();
-        let sha1_func = self.module.load_function("sha1_simple")
-            .map_err(|e| CudaError::KernelLoadError(e))?;
-
-        // SHA1 initial hash values
-        let mut h: [u32; 5] = [
-            0x67452301,
-            0xEFCDAB89,
-            0x98BADCFE,
-            0x10325476,
-            0xC3D2E1F0,
-        ];
+        let mut h = SHA1_INIT_HASH;
 
         // Process each block, chaining the hash values
         for block in blocks {
-            // Allocate device memory and copy input block
-            let d_input = stream.memcpy_stod(&block)
-                .map_err(CudaError::MemoryError)?;
-
-            // Copy current hash state to device
-            let d_init_hash = stream.memcpy_stod(&h)
-                .map_err(CudaError::MemoryError)?;
-
-            let mut d_output = stream.alloc_zeros::<u32>(5)
-                .map_err(CudaError::MemoryError)?;
-
-            // Launch kernel: 1 hash, 1 thread
-            let cfg = LaunchConfig {
-                grid_dim: (1, 1, 1),
-                block_dim: (1, 1, 1),
-                shared_mem_bytes: 0,
-            };
-
-            // SAFETY: Kernel launch is safe because:
-            // 1. d_input is a valid CudaSlice containing 16 u32 values (matching kernel's const unsigned int* inputs)
-            // 2. d_output is a valid CudaSlice with space for 5 u32 values (matching kernel's unsigned int* outputs)
-            // 3. num_hashes is correctly set to 1 (matching kernel's int num_hashes)
-            // 4. d_init_hash is a valid CudaSlice containing 5 u32 values (matching kernel's const unsigned int* init_hash)
-            // 5. All memory is allocated on the same device and outlives the kernel execution
-            // 6. The kernel grid/block dimensions are set to (1,1,1) ensuring only one thread executes
-            unsafe {
-                stream.launch_builder(&sha1_func)
-                    .arg(&d_input)
-                    .arg(&mut d_output)
-                    .arg(&1i32)
-                    .arg(&d_init_hash)
-                    .launch(cfg)
-            }.map_err(CudaError::KernelLaunchError)?;
-
-            // Copy result back to host
-            let output: Vec<u32> = stream.memcpy_dtov(&d_output)
-                .map_err(CudaError::MemoryError)?;
-
-            // Update hash values for next block (chaining)
-            h.copy_from_slice(&output[..5]);
+            let output = launch_single_block_kernel(&self.ctx, &self.module, &block, &h)?;
+            h.copy_from_slice(&output);
         }
 
-        // Convert final hash from u32 words to bytes (big-endian)
-        let mut hash_bytes = [0u8; 20];
-        for (i, &word) in h.iter().enumerate() {
-            let bytes = word.to_be_bytes();
-            hash_bytes[i * 4..(i + 1) * 4].copy_from_slice(&bytes);
-        }
-
-        Ok(hash_bytes)
+        Ok(words_to_hash_bytes(&h))
     }
 }
 
@@ -126,9 +139,186 @@ impl SecurityLevelHasher for CudaHasher {
         crate::helpers::count_trailing_zero_bits(&hash)
     }
 
+    /// Batch processing using CUDA for parallel GPU computation
+    fn calculate_levels_batch(&self, public_key: &str, counters: &[u64]) -> Vec<u8> {
+        if counters.is_empty() {
+            return Vec::new();
+        }
+
+        // Prepare all messages (public_key + counter)
+        let mut messages_data: Vec<Vec<u8>> = Vec::with_capacity(counters.len());
+        for &counter in counters {
+            let counter_str = counter.to_string();
+            let mut message = Vec::new();
+            message.extend_from_slice(public_key.as_bytes());
+            message.extend_from_slice(counter_str.as_bytes());
+            messages_data.push(message);
+        }
+
+        let messages_refs: Vec<&[u8]> = messages_data.iter()
+            .map(|m| m.as_slice())
+            .collect();
+
+        // Hash all messages in batch
+        match self.hash_messages_batch(&messages_refs) {
+            Ok(hashes) => {
+                // Count trailing zero bits for each hash
+                hashes.iter()
+                    .map(|hash| crate::helpers::count_trailing_zero_bits(hash))
+                    .collect()
+            }
+            Err(_) => {
+                // Fall back to sequential processing on error
+                counters.iter()
+                    .map(|&counter| self.calculate_level(public_key, counter))
+                    .collect()
+            }
+        }
+    }
+
     fn name(&self) -> &str {
         "CUDA"
     }
+}
+
+/// Convert 5 u32 words to a 20-byte SHA1 hash (big-endian)
+fn words_to_hash_bytes(words: &[u32; 5]) -> [u8; 20] {
+    let mut hash_bytes = [0u8; 20];
+    for (i, &word) in words.iter().enumerate() {
+        let bytes = word.to_be_bytes();
+        hash_bytes[i * 4..(i + 1) * 4].copy_from_slice(&bytes);
+    }
+    hash_bytes
+}
+
+/// Launch CUDA kernel for a single SHA1 block
+///
+/// # Safety invariants
+/// This function maintains the following invariants:
+/// - d_input contains exactly 16 u32 values
+/// - d_init_hash contains exactly 5 u32 values
+/// - Returns exactly 5 u32 values
+fn launch_single_block_kernel(
+    ctx: &Arc<CudaContext>,
+    module: &Arc<CudaModule>,
+    block: &[u32; 16],
+    init_hash: &[u32; 5],
+) -> Result<[u32; 5], CudaError> {
+    let stream = ctx.default_stream();
+    let sha1_func = module.load_function("sha1_simple")
+        .map_err(|e| CudaError::KernelLoadError(e))?;
+
+    // Allocate device memory
+    let d_input = stream.memcpy_stod(block)
+        .map_err(CudaError::MemoryError)?;
+    let d_init_hash = stream.memcpy_stod(init_hash)
+        .map_err(CudaError::MemoryError)?;
+    let mut d_output = stream.alloc_zeros::<u32>(5)
+        .map_err(CudaError::MemoryError)?;
+
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (1, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    // SAFETY: Kernel launch is safe because:
+    // 1. d_input is a valid CudaSlice containing 16 u32 values
+    // 2. d_output is a valid CudaSlice with space for 5 u32 values
+    // 3. num_hashes is set to 1
+    // 4. d_init_hash is a valid CudaSlice containing 5 u32 values
+    // 5. All memory is allocated on the same device and outlives the kernel
+    // 6. Grid/block dimensions (1,1,1) ensure only one thread executes
+    #[allow(unsafe_code)]
+    unsafe {
+        stream.launch_builder(&sha1_func)
+            .arg(&d_input)
+            .arg(&mut d_output)
+            .arg(&1i32)
+            .arg(&d_init_hash)
+            .launch(cfg)
+    }.map_err(CudaError::KernelLaunchError)?;
+
+    // Copy result back
+    let output: Vec<u32> = stream.memcpy_dtov(&d_output)
+        .map_err(CudaError::MemoryError)?;
+
+    let mut result = [0u32; 5];
+    result.copy_from_slice(&output[..5]);
+    Ok(result)
+}
+
+/// Launch CUDA kernel for batch SHA1 hashing
+///
+/// # Safety invariants
+/// - flat_input contains num_hashes * 16 u32 values
+/// - init_hash contains exactly 5 u32 values
+/// - Returns num_hashes hash results
+fn launch_batch_kernel(
+    ctx: &Arc<CudaContext>,
+    module: &Arc<CudaModule>,
+    flat_input: &[u32],
+    init_hash: &[u32; 5],
+    num_hashes: usize,
+) -> Result<Vec<[u8; 20]>, CudaError> {
+    let stream = ctx.default_stream();
+    let sha1_func = module.load_function("sha1_simple")
+        .map_err(|e| CudaError::KernelLoadError(e))?;
+
+    // Allocate device memory
+    let d_input = stream.memcpy_stod(flat_input)
+        .map_err(CudaError::MemoryError)?;
+    let d_init_hash = stream.memcpy_stod(init_hash)
+        .map_err(CudaError::MemoryError)?;
+    let mut d_output = stream.alloc_zeros::<u32>(num_hashes * 5)
+        .map_err(CudaError::MemoryError)?;
+
+    // Launch kernel with multiple threads (256 threads per block)
+    let threads_per_block = 256;
+    let num_blocks = (num_hashes + threads_per_block - 1) / threads_per_block;
+
+    let cfg = LaunchConfig {
+        grid_dim: (num_blocks as u32, 1, 1),
+        block_dim: (threads_per_block as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    // SAFETY: Kernel launch is safe because:
+    // 1. d_input contains num_hashes * 16 u32 values
+    // 2. d_output has space for num_hashes * 5 u32 values
+    // 3. num_hashes is correctly set
+    // 4. d_init_hash contains 5 u32 values (shared initial state)
+    // 5. All memory is allocated on the same device and outlives the kernel
+    // 6. Grid/block dimensions ensure num_hashes threads execute
+    #[allow(unsafe_code)]
+    unsafe {
+        stream.launch_builder(&sha1_func)
+            .arg(&d_input)
+            .arg(&mut d_output)
+            .arg(&(num_hashes as i32))
+            .arg(&d_init_hash)
+            .launch(cfg)
+    }.map_err(CudaError::KernelLaunchError)?;
+
+    // Copy all results back
+    let output: Vec<u32> = stream.memcpy_dtov(&d_output)
+        .map_err(CudaError::MemoryError)?;
+
+    // Convert to byte arrays
+    let results = (0..num_hashes)
+        .map(|i| {
+            let words: [u32; 5] = [
+                output[i * 5],
+                output[i * 5 + 1],
+                output[i * 5 + 2],
+                output[i * 5 + 3],
+                output[i * 5 + 4],
+            ];
+            words_to_hash_bytes(&words)
+        })
+        .collect();
+
+    Ok(results)
 }
 
 /// Prepare a message for SHA1 hashing by splitting it into 64-byte blocks
@@ -334,5 +524,67 @@ mod tests {
 
         assert_eq!(cuda_level, cpu_level,
             "CUDA and CPU implementations should produce the same result for long messages");
+    }
+
+    #[test]
+    fn test_batch_hashing() {
+        // Test that batch hashing produces correct results
+        let hasher = CudaHasher::new().expect("Failed to initialize CUDA hasher");
+
+        let messages: Vec<&[u8]> = vec![b"123", b"abc", b"xyz"];
+
+        let batch_results = hasher.hash_messages_batch(&messages)
+            .expect("Batch hashing failed");
+
+        assert_eq!(batch_results.len(), 3, "Should have 3 results");
+
+        // Verify each hash matches individual computation
+        for (i, msg) in messages.iter().enumerate() {
+            let individual_hash = hasher.hash_message(msg)
+                .expect("Individual hash failed");
+            assert_eq!(batch_results[i], individual_hash,
+                "Batch hash for '{}' should match individual hash",
+                String::from_utf8_lossy(msg));
+        }
+
+        // Verify specific known hashes
+        let hash_123 = batch_results[0].iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>();
+        let hash_abc = batch_results[1].iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<String>();
+
+        assert_eq!(hash_123, "40bd001563085fc35165329ea1ff5c5ecbdbbeef", "SHA1('123') mismatch");
+        assert_eq!(hash_abc, "a9993e364706816aba3e25717850c26c9cd0d89d", "SHA1('abc') mismatch");
+    }
+
+    #[test]
+    fn test_batch_hashing_large() {
+        // Test batch hashing with many inputs (simulates TS3 counter searching)
+        let hasher = CudaHasher::new().expect("Failed to initialize CUDA hasher");
+
+        // Create 1000 different messages
+        let mut messages_vec: Vec<String> = Vec::new();
+        for i in 0..1000 {
+            messages_vec.push(format!("test_message_{}", i));
+        }
+
+        let messages: Vec<&[u8]> = messages_vec.iter()
+            .map(|s| s.as_bytes())
+            .collect();
+
+        let batch_results = hasher.hash_messages_batch(&messages)
+            .expect("Large batch hashing failed");
+
+        assert_eq!(batch_results.len(), 1000, "Should have 1000 results");
+
+        // Spot check a few results
+        for i in [0, 500, 999].iter() {
+            let individual_hash = hasher.hash_message(messages[*i])
+                .expect("Individual hash failed");
+            assert_eq!(batch_results[*i], individual_hash,
+                "Batch hash at index {} should match individual hash", i);
+        }
     }
 }

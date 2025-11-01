@@ -11,7 +11,11 @@ sha1 = "0.10"
 ctrlc = "3.4"
 clap = { version = "4.5", features = ["derive"] }
 cudarc = { version = "0.17.6", features = ["cuda-13000"] }
+rayon = "1.10"
 
+[lib]
+name = "ts3_sec_cuda_rs"
+path = "src/lib.rs"
 
 [[bin]]
 name = "ts3-sec-cuda-rs"

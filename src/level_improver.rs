@@ -9,12 +9,22 @@ use ini::Ini;
 use crate::identity::{Ts3Identity, IdentityError};
 use crate::helpers;
 
-const BATCH_SIZE: u64 = 10_000; // Check this many counters before printing progress
+#[allow(dead_code)] // Public API default
+const DEFAULT_BATCH_SIZE: usize = 10_000; // Default batch size for processing
 
 /// Trait for implementing different hashing strategies (CPU, GPU, etc.)
 pub trait SecurityLevelHasher {
     /// Calculate the security level for a given public key and counter
     fn calculate_level(&self, public_key: &str, counter: u64) -> u8;
+
+    /// Calculate security levels for a batch of counters
+    ///
+    /// Default implementation processes sequentially. Override for parallel/batch processing.
+    fn calculate_levels_batch(&self, public_key: &str, counters: &[u64]) -> Vec<u8> {
+        counters.iter()
+            .map(|&counter| self.calculate_level(public_key, counter))
+            .collect()
+    }
 
     /// Get the name of this hasher (for display purposes)
     fn name(&self) -> &str;
@@ -47,11 +57,18 @@ pub struct LevelImprover<H: SecurityLevelHasher> {
     hashes_checked: u64,
     last_save: Instant,
     start_time: Instant,
+    batch_size: usize,
 }
 
 impl<H: SecurityLevelHasher> LevelImprover<H> {
-    /// Create a new LevelImprover for the given identity file
+    /// Create a new LevelImprover for the given identity file with default batch size
+    #[allow(dead_code)] // Public API method
     pub fn new<P: AsRef<Path>>(path: P, hasher: H) -> Result<Self, IdentityError> {
+        Self::with_batch_size(path, hasher, DEFAULT_BATCH_SIZE)
+    }
+
+    /// Create a new LevelImprover with a custom batch size
+    pub fn with_batch_size<P: AsRef<Path>>(path: P, hasher: H, batch_size: usize) -> Result<Self, IdentityError> {
         let path_str = path.as_ref().to_string_lossy().to_string();
         let identity = Ts3Identity::from_file(&path)?;
 
@@ -87,7 +104,7 @@ impl<H: SecurityLevelHasher> LevelImprover<H> {
         println!("Loaded identity from {}", path_str);
         println!("Current counter: {}", current_counter);
         println!("Current security level: {}", current_level);
-        println!("Using hasher: {}", hasher.name());
+        println!("Using hasher: {} (batch size: {})", hasher.name(), batch_size);
 
         Ok(Self {
             identity,
@@ -101,10 +118,12 @@ impl<H: SecurityLevelHasher> LevelImprover<H> {
             hashes_checked: 0,
             last_save: Instant::now(),
             start_time: Instant::now(),
+            batch_size,
         })
     }
 
     /// Calculate the security level for a given counter value
+    #[allow(dead_code)] // May be useful for debugging
     fn calculate_level(&self, counter: u64) -> u8 {
         let omega = self.identity.public_key_base64();
         self.hasher.calculate_level(&omega, counter)
@@ -212,14 +231,23 @@ impl<H: SecurityLevelHasher> LevelImprover<H> {
             if !should_continue {
                 return Ok(());
             }
-            // Check a batch of counters
-            for _ in 0..BATCH_SIZE {
-                let level = self.calculate_level(self.current_counter);
-                self.hashes_checked += 1;
+
+            // Prepare batch of counters to check
+            let counters: Vec<u64> = (self.current_counter..self.current_counter + self.batch_size as u64).collect();
+
+            // Process entire batch at once (parallel on CPU, batched on GPU)
+            let omega = self.identity.public_key_base64();
+            let levels = self.hasher.calculate_levels_batch(&omega, &counters);
+
+            self.hashes_checked += counters.len() as u64;
+
+            // Check for improved levels in batch results
+            for (i, &level) in levels.iter().enumerate() {
+                let counter = counters[i];
 
                 if level > self.best_level {
                     self.best_level = level;
-                    self.best_counter = self.current_counter;
+                    self.best_counter = counter;
 
                     let result = LevelSearchResult {
                         counter: self.best_counter,
@@ -242,18 +270,15 @@ impl<H: SecurityLevelHasher> LevelImprover<H> {
                         return Ok(());
                     }
                 }
-
-                self.current_counter += 1;
             }
+
+            self.current_counter += self.batch_size as u64;
 
             // Print progress every second
             if last_print.elapsed() >= Duration::from_secs(1) {
                 helpers::print_progress(self.best_level, self.current_counter, self.hashes_checked, self.start_time);
                 last_print = Instant::now();
             }
-
-            // Note: We only save when finding new levels, not periodically
-            // This prevents creating unnecessary files
         }
     }
 }
