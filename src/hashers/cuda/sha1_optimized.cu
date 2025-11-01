@@ -3,46 +3,29 @@
 // - Generates counter strings on GPU
 // - No CPU-side string allocations
 // - Directly outputs security levels (trailing zero bits)
-// - Optimized with intrinsics and loop unrolling
+// - Optimized with circular buffer for reduced register pressure
 
 #define ROTLEFT(a,b) (((a) << (b)) | ((a) >> (32-(b))))
 
 // Device function: Convert u64 to ASCII string (decimal representation)
 // Returns the number of digits written
-// Optimized version using fewer divisions by processing digits in chunks of 4
 __device__ int u64_to_string(unsigned long long value, unsigned char* buffer) {
     if (value == 0) {
         buffer[0] = '0';
         return 1;
     }
 
-    // Convert using fast division by powers of 10
     // Temporary buffer to store digits in reverse order
-    unsigned char temp[20];  // Max digits for u64 is 20
+    unsigned char temp[20];
     int count = 0;
 
-    // Unrolled division: process 4 digits at a time to reduce expensive division ops
-    // Division by 10000 is much faster than four separate divisions by 10
-    while (value >= 10000) {
-        unsigned long long q = value / 10000;  // Quotient
-        unsigned int r = value - q * 10000;     // Remainder (last 4 digits)
-
-        // Extract 4 digits from remainder (stored in reverse)
-        temp[count++] = '0' + (r % 10); r /= 10;
-        temp[count++] = '0' + (r % 10); r /= 10;
-        temp[count++] = '0' + (r % 10); r /= 10;
-        temp[count++] = '0' + r;
-
-        value = q;  // Continue with quotient
-    }
-
-    // Handle remaining digits (< 10000) using standard division
+    // Extract digits one by one
     while (value > 0) {
         temp[count++] = '0' + (value % 10);
         value /= 10;
     }
 
-    // Reverse digits into output buffer (stored in reverse in temp)
+    // Reverse digits into output buffer
     for (int i = 0; i < count; i++) {
         buffer[i] = temp[count - 1 - i];
     }
@@ -57,7 +40,6 @@ __device__ unsigned char count_trailing_zero_bits(const unsigned int* hash) {
 
     // Hash is stored as 5 x 32-bit words
     // We need to convert to bytes and count from byte 0 (MSB) onwards
-    // Word 0 = bytes 0-3, Word 1 = bytes 4-7, etc.
     for (int word_idx = 0; word_idx < 5; word_idx++) {
         unsigned int word = hash[word_idx];
 
@@ -70,13 +52,11 @@ __device__ unsigned char count_trailing_zero_bits(const unsigned int* hash) {
                 count += 8;
             } else {
                 // Count trailing zeros in this byte
-                // trailing_zeros counts from LSB, which is what we want
                 unsigned char tz = 0;
                 while (tz < 8 && (byte & (1u << tz)) == 0) {
                     tz++;
                 }
-                count += tz;
-                return count;
+                return count + tz;
             }
         }
     }
@@ -85,7 +65,7 @@ __device__ unsigned char count_trailing_zero_bits(const unsigned int* hash) {
 }
 
 // Device function: Perform SHA1 hash on a single block (64 bytes) with custom initial hash
-// Optimized to reduce register pressure by computing w[] on-the-fly
+// Optimized to reduce register pressure by computing w[] on-the-fly using circular buffer
 __device__ void sha1_single_block_with_init(const unsigned int* block, unsigned int* hash_out, const unsigned int* init_hash) {
     // Use provided initial hash values (or SHA1 default if this is the first block)
     unsigned int h0 = init_hash[0];
@@ -182,6 +162,10 @@ __device__ void sha1_single_block_with_init(const unsigned int* block, unsigned 
 
 // Optimized kernel: Compute security levels for a range of counters
 // Each thread handles one counter value
+// OPTIMIZATIONS:
+// - Shared memory for public key (fast L1 cache)
+// - Circular buffer for w[] in SHA1 (16 words instead of 80)
+// - Multi-block SHA1 support for large messages
 extern "C" __global__ void sha1_security_level_optimized(
     const unsigned char* public_key,   // Public key bytes in device memory
     int public_key_len,                // Length of public key
@@ -208,7 +192,7 @@ extern "C" __global__ void sha1_security_level_optimized(
     unsigned long long counter = start_counter + idx;
 
     // Build message: public_key + counter_string
-    unsigned char message[128];  // Reduced stack: 108 (key) + 20 (max counter) = 128
+    unsigned char message[128];  // Buffer for public_key + counter
     int msg_len = 0;
 
     // Copy public key from shared memory (much faster than device memory!)
@@ -241,7 +225,7 @@ extern "C" __global__ void sha1_security_level_optimized(
                        ((unsigned int)message[pos + i*4 + 3]);
         }
 
-        // Process this block
+        // Process this block using circular buffer optimization
         sha1_single_block_with_init(block, hash, hash);
         pos += 64;
     }
