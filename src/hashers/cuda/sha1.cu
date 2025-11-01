@@ -1,28 +1,27 @@
 // sha1.cu
-#include <stdint.h>
-
+// Using native CUDA types (unsigned int = 32-bit)
 #define ROTLEFT(a,b) (((a) << (b)) | ((a) >> (32-(b))))
 
 extern "C" __global__ void sha1_simple(
-    const uint32_t* inputs,  // Input data (16 words per hash)
-    uint32_t* outputs,        // Output hashes (5 words per hash)
+    const unsigned int* inputs,  // Input data (16 words per hash)
+    unsigned int* outputs,        // Output hashes (5 words per hash)
     int num_hashes
 ) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_hashes) return;
 
     // SHA1 initial hash values
-    uint32_t h0 = 0x67452301;
-    uint32_t h1 = 0xEFCDAB89;
-    uint32_t h2 = 0x98BADCFE;
-    uint32_t h3 = 0x10325476;
-    uint32_t h4 = 0xC3D2E1F0;
+    unsigned int h0 = 0x67452301;
+    unsigned int h1 = 0xEFCDAB89;
+    unsigned int h2 = 0x98BADCFE;
+    unsigned int h3 = 0x10325476;
+    unsigned int h4 = 0xC3D2E1F0;
 
     // Get input block for this thread (16 words = 64 bytes)
-    const uint32_t* block = &inputs[idx * 16];
+    const unsigned int* block = &inputs[idx * 16];
 
     // Expand to 80 words
-    uint32_t w[80];
+    unsigned int w[80];
     for (int i = 0; i < 16; i++) {
         w[i] = block[i];
     }
@@ -31,8 +30,8 @@ extern "C" __global__ void sha1_simple(
     }
 
     // Main loop (80 rounds)
-    uint32_t a = h0, b = h1, c = h2, d = h3, e = h4;
-    uint32_t f, k, temp;
+    unsigned int a = h0, b = h1, c = h2, d = h3, e = h4;
+    unsigned int f, k, temp;
 
     for (int i = 0; i < 80; i++) {
         if (i < 20) {
