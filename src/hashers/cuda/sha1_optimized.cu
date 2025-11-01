@@ -3,7 +3,7 @@
 // - Generates counter strings on GPU
 // - No CPU-side string allocations
 // - Directly outputs security levels (trailing zero bits)
-// - Public key stored in device memory
+// - Optimized with intrinsics and loop unrolling
 
 #define ROTLEFT(a,b) (((a) << (b)) | ((a) >> (32-(b))))
 
@@ -34,7 +34,6 @@ __device__ int u64_to_string(unsigned long long value, unsigned char* buffer) {
 
 // Device function: Count trailing zero bits in a 160-bit SHA1 hash
 // Note: "trailing" here means from the beginning of the byte representation (byte 0 onwards)
-// matching the CPU implementation
 __device__ unsigned char count_trailing_zero_bits(const unsigned int* hash) {
     unsigned char count = 0;
 
@@ -85,25 +84,54 @@ __device__ void sha1_single_block_with_init(const unsigned int* block, unsigned 
         w[i] = ROTLEFT((w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16]), 1);
     }
 
-    // Main loop (80 rounds)
+    // Main loop (80 rounds) - unrolled into 4 loops to eliminate branches
     unsigned int a = h0, b = h1, c = h2, d = h3, e = h4;
     unsigned int f, k, temp;
 
-    for (int i = 0; i < 80; i++) {
-        if (i < 20) {
-            f = (b & c) | ((~b) & d);
-            k = 0x5A827999;
-        } else if (i < 40) {
-            f = b ^ c ^ d;
-            k = 0x6ED9EBA1;
-        } else if (i < 60) {
-            f = (b & c) | (b & d) | (c & d);
-            k = 0x8F1BBCDC;
-        } else {
-            f = b ^ c ^ d;
-            k = 0xCA62C1D6;
-        }
+    // Rounds 0-19: f = (b & c) | ((~b) & d), k = 0x5A827999
+    k = 0x5A827999;
+    #pragma unroll
+    for (int i = 0; i < 20; i++) {
+        f = (b & c) | ((~b) & d);
+        temp = ROTLEFT(a, 5) + f + e + k + w[i];
+        e = d;
+        d = c;
+        c = ROTLEFT(b, 30);
+        b = a;
+        a = temp;
+    }
 
+    // Rounds 20-39: f = b ^ c ^ d, k = 0x6ED9EBA1
+    k = 0x6ED9EBA1;
+    #pragma unroll
+    for (int i = 20; i < 40; i++) {
+        f = b ^ c ^ d;
+        temp = ROTLEFT(a, 5) + f + e + k + w[i];
+        e = d;
+        d = c;
+        c = ROTLEFT(b, 30);
+        b = a;
+        a = temp;
+    }
+
+    // Rounds 40-59: f = (b & c) | (b & d) | (c & d), k = 0x8F1BBCDC
+    k = 0x8F1BBCDC;
+    #pragma unroll
+    for (int i = 40; i < 60; i++) {
+        f = (b & c) | (b & d) | (c & d);
+        temp = ROTLEFT(a, 5) + f + e + k + w[i];
+        e = d;
+        d = c;
+        c = ROTLEFT(b, 30);
+        b = a;
+        a = temp;
+    }
+
+    // Rounds 60-79: f = b ^ c ^ d, k = 0xCA62C1D6
+    k = 0xCA62C1D6;
+    #pragma unroll
+    for (int i = 60; i < 80; i++) {
+        f = b ^ c ^ d;
         temp = ROTLEFT(a, 5) + f + e + k + w[i];
         e = d;
         d = c;
@@ -123,7 +151,7 @@ __device__ void sha1_single_block_with_init(const unsigned int* block, unsigned 
 // Optimized kernel: Compute security levels for a range of counters
 // Each thread handles one counter value
 extern "C" __global__ void sha1_security_level_optimized(
-    const unsigned char* public_key,  // Public key bytes (in device memory)
+    const unsigned char* public_key,   // Public key bytes in device memory
     int public_key_len,                // Length of public key
     unsigned long long start_counter,  // Starting counter value
     int num_counters,                  // Number of counters to process
@@ -136,10 +164,10 @@ extern "C" __global__ void sha1_security_level_optimized(
     unsigned long long counter = start_counter + idx;
 
     // Build message: public_key + counter_string
-    unsigned char message[256];  // Stack allocation per thread (max message size)
+    unsigned char message[128];  // Reduced stack: 108 (key) + 20 (max counter) = 128
     int msg_len = 0;
 
-    // Copy public key
+    // Copy public key from device memory
     for (int i = 0; i < public_key_len; i++) {
         message[msg_len++] = public_key[i];
     }
