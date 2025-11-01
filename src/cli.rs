@@ -40,8 +40,8 @@ pub enum Command {
         #[arg(short = 'm', long, value_enum, default_value_t = HasherMethod::Cpu)]
         method: HasherMethod,
 
-        /// Batch size for processing (CPU: 10000, CUDA: 100000)
-        /// Higher values = better GPU utilization but more memory
+        /// Batch size for processing (CPU: 10000, CUDA: 4000000)
+        /// 4M provides optimal throughput for TS3 keys (2.15B h/s)
         #[arg(short, long)]
         batch_size: Option<usize>,
 
